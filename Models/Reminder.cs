@@ -16,6 +16,7 @@ namespace ReminderBot.Models
         public string Time { get; set; } = "00:00";
         public DateTime? NextTriggerUtc { get; set; }
         public bool IsActive { get; set; } = true;
+        public int? IntervalMinutes { get; set; } // Интервал в минутах (для гибкости)
         
         [ForeignKey(nameof(AppUser))]
         public long UserId { get; set; }

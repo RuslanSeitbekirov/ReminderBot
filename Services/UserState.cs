@@ -18,5 +18,6 @@ namespace ReminderBot.Services
 
         // Шаги удаления
         public const int DeletingReminder = 10;
+        public const int SettingTimezone = 11;  // ← ДОБАВЬТЕ ЭТУ СТРОКУ
     }
 }

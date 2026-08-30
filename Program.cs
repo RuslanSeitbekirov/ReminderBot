@@ -15,14 +15,24 @@ namespace ReminderBot
         private static readonly Dictionary<long, (int State, Reminder? TempReminder)> _userStates = new();
         private static ReminderService _reminderService = null!;
         private static ITelegramBotClient _botClient = null!;
+        private static AppDbContext _context = null!;
 
         static async Task Main(string[] args)
         {
-            using var context = new AppDbContext();
-            await context.Database.EnsureCreatedAsync();
-            _reminderService = new ReminderService(context);
+            LoadEnvFile();
 
-            var botToken = "8825595358:AAEaDfFAjo7yZNw2AGGQ-o-Ykp2VZNKrC1c";
+            _context = new AppDbContext();  // ← Используем только статическое поле
+            await _context.Database.EnsureCreatedAsync();
+            _reminderService = new ReminderService(_context);
+
+                var botToken = Environment.GetEnvironmentVariable("BOT_TOKEN");
+    
+            if (string.IsNullOrEmpty(botToken))
+            {
+                Console.WriteLine("❌ Ошибка: BOT_TOKEN не найден!");
+                Console.WriteLine("Создайте файл .env с переменной BOT_TOKEN=ваш_токен");
+                return;
+            }
             _botClient = new TelegramBotClient(botToken);
 
             using var cts = new CancellationTokenSource();
@@ -118,10 +128,11 @@ namespace ReminderBot
                                 "🕐 Введите время в формате ЧЧ:ММ (например, 14:30):");
                             break;
 
-                        case "Hourly":
+                        case "Interval":
                             _userStates[userId] = (UserState.EnteringInterval, tempReminder);
                             await botClient.SendTextMessageAsync(userId, 
-                                "⏰ Введите интервал в часах (например, 6):");
+                                " Введите интервал в минутах (например, 60 для каждого часа, 40 для каждых 40 минут):\n" +
+                                "Или в формате Ч:ММ (например, 1:30 для 1 часа 30 минут):");
                             break;
 
                         case "Weekly":
@@ -296,14 +307,19 @@ namespace ReminderBot
                         messageText += $"<b>{r.Id}. {EscapeHtml(r.Title)}</b>\n";
                         messageText += $"   Текст: {EscapeHtml(r.Text)}\n";
                         messageText += $"   Расписание: {GetScheduleDescription(r)}\n";
-                        messageText += $"   Следующее: {r.NextTriggerUtc?.ToLocalTime():dd.MM.yyyy HH:mm}\n\n";
+                        var userTZ = user.TimezoneOffsetHours;
+                        var localTime = r.NextTriggerUtc?.AddHours(userTZ);
+                        messageText += $"   Следующее: {localTime:dd.MM.yyyy HH:mm} (UTC{userTZ:+#;-#;0})\n\n";
                     }
 
                     await botClient.SendTextMessageAsync(userId, messageText, parseMode: ParseMode.Html);
                     break;
 
-                default:
-                    await botClient.SendTextMessageAsync(userId, "Неизвестная команда.");
+                case "/timezone":
+                    _userStates[userId] = (UserState.SettingTimezone, null);
+                    await botClient.SendTextMessageAsync(userId, 
+                        $"🕐 Ваш текущий часовой пояс: UTC{user.TimezoneOffsetHours:+#;-#;0}\n" +
+                        "Введите смещение (например, 3 для UTC+3 или -5 для UTC-5):");
                     break;
             }
         }
@@ -352,52 +368,83 @@ namespace ReminderBot
                         var scheduleKeyboard = new InlineKeyboardMarkup(new[]
                         {
                             new[] { InlineKeyboardButton.WithCallbackData("📅 Каждый день", "schedule_daily") },
-                            new[] { InlineKeyboardButton.WithCallbackData("⏰ Каждые N часов", "schedule_hourly") },
+                            new[] { InlineKeyboardButton.WithCallbackData("⏰ Каждые N минут/часов", "schedule_interval") },
                             new[] { InlineKeyboardButton.WithCallbackData(" В определенные дни", "schedule_weekly") }
                         });
                         await botClient.SendTextMessageAsync(userId, 
                             "Выберите тип расписания:", replyMarkup: scheduleKeyboard);
                         break;
 
-                    case UserState.EnteringInterval:
-                        Console.WriteLine("[Input] Processing EnteringInterval");
-                        if (tempReminder == null) 
-                        {
+                        case UserState.EnteringInterval:
+                            Console.WriteLine("[Input] Processing EnteringInterval");
+                            if (tempReminder == null) 
+                            {
+                                await botClient.SendTextMessageAsync(userId, 
+                                    "⚠️ Ошибка сессии. Начните заново с /create_note");
+                                return;
+                            }
+                            // Пробуем разные форматы
+                            int totalMinutes = 0;
+                            if (text.Contains(':'))
+                            {
+                                // Формат "1:30" (1 час 30 минут)
+                                var parts = text.Split(':');
+                                if (parts.Length == 2 && 
+                                    int.TryParse(parts[0], out var hrs) && 
+                                    int.TryParse(parts[1], out var mins) &&
+                                    hrs >= 0 && mins >= 0 && mins < 60)
+                                {
+                                    totalMinutes = hrs * 60 + mins;
+                                }
+                            }
+                            else if (int.TryParse(text, out var minutes) && minutes > 0)
+                            {
+                                // Просто число минут
+                                totalMinutes = minutes;
+                            }
+                            
+                            if (totalMinutes <= 0)
+                            {
+                                await botClient.SendTextMessageAsync(userId, 
+                                    "⚠️ Неверный формат. Введите число минут (например, 60) или Ч:ММ (например, 1:30):");
+                                return;
+                            }
+                            
+                            tempReminder.IntervalMinutes = totalMinutes;
+                            tempReminder.Time = "00:00"; // Для Interval время не используется, ставим заглушку
+                            
+                            // Создаем напоминание сразу, без запроса времени
+                            Console.WriteLine($"[Input] Creating reminder: {tempReminder.Title}, {tempReminder.ScheduleType}");
+                            var reminder = await _reminderService.CreateReminderAsync(
+                                userId, tempReminder.Title, tempReminder.Text,
+                                tempReminder.ScheduleType, tempReminder.IntervalHours,
+                                tempReminder.IntervalMinutes, tempReminder.WeekDays, tempReminder.Time);
+                            
+                            _userStates.Remove(userId);
                             await botClient.SendTextMessageAsync(userId, 
-                                "️ Ошибка сессии. Начните заново с /create_note");
-                            return;
-                        }
-                        if (!int.TryParse(text, out var hours) || hours <= 0)
-                        {
-                            await botClient.SendTextMessageAsync(userId, 
-                                "⚠️ Введите положительное число (количество часов):");
-                            return;
-                        }
-                        tempReminder.IntervalHours = hours;
-                        _userStates[userId] = (UserState.EnteringTime, tempReminder);
-                        await botClient.SendTextMessageAsync(userId, 
-                            " Введите время в формате ЧЧ:ММ (например, 14:30):");
-                        break;
+                                $"✅ Напоминание \"{reminder.Title}\" создано!\n" +
+                                $"Будет срабатывать каждые {totalMinutes} мин.");
+                            break;
 
-                    case UserState.EnteringWeekDays:
-                        Console.WriteLine("[Input] Processing EnteringWeekDays");
-                        if (tempReminder == null) 
-                        {
+                        case UserState.EnteringWeekDays:
+                            Console.WriteLine("[Input] Processing EnteringWeekDays");
+                            if (tempReminder == null) 
+                            {
+                                await botClient.SendTextMessageAsync(userId, 
+                                    "⚠️ Ошибка сессии. Начните заново с /create_note");
+                                return;
+                            }
+                            if (!IsValidWeekDays(text))
+                            {
+                                await botClient.SendTextMessageAsync(userId, 
+                                    "⚠️ Введите дни недели через запятую (1=Пн, 2=Вт, ..., 7=Вс). Например: 1,3,5");
+                                return;
+                            }
+                            tempReminder.WeekDays = text;
+                            _userStates[userId] = (UserState.EnteringTime, tempReminder);
                             await botClient.SendTextMessageAsync(userId, 
-                                "⚠️ Ошибка сессии. Начните заново с /create_note");
-                            return;
-                        }
-                        if (!IsValidWeekDays(text))
-                        {
-                            await botClient.SendTextMessageAsync(userId, 
-                                "⚠️ Введите дни недели через запятую (1=Пн, 2=Вт, ..., 7=Вс). Например: 1,3,5");
-                            return;
-                        }
-                        tempReminder.WeekDays = text;
-                        _userStates[userId] = (UserState.EnteringTime, tempReminder);
-                        await botClient.SendTextMessageAsync(userId, 
-                            " Введите время в формате ЧЧ:ММ (например, 14:30):");
-                        break;
+                                " Введите время в формате ЧЧ:ММ (например, 14:30):");
+                            break;
 
                         case UserState.EnteringTime:
                             Console.WriteLine("[Input] Processing EnteringTime");
@@ -407,7 +454,6 @@ namespace ReminderBot
                                     "⚠️ Ошибка сессии. Начните заново с /create_note");
                                 return;
                             }
-                            
                             // Гибкий парсинг времени
                             var timeText = text.Trim();
                             if (!TimeSpan.TryParseExact(timeText, new[] { "hh\\:mm", "h\\:mm", "hh:mm", "h:mm" }, 
@@ -430,51 +476,38 @@ namespace ReminderBot
                                     return;
                                 }
                             }
-                            
                             tempReminder.Time = $"{timeSpan.Hours:D2}:{timeSpan.Minutes:D2}";
-                        
-                        Console.WriteLine($"[Input] Creating reminder: {tempReminder.Title}, {tempReminder.ScheduleType}");
-                        
-                        var reminder = await _reminderService.CreateReminderAsync(
-                            userId, tempReminder.Title, tempReminder.Text,
-                            tempReminder.ScheduleType, tempReminder.IntervalHours,
-                            tempReminder.WeekDays, tempReminder.Time);
-
-                        _userStates.Remove(userId);
-                        await botClient.SendTextMessageAsync(userId, 
-                            $"✅ Напоминание \"{reminder.Title}\" создано!\n" +
-                            $"Следующее срабатывание: {reminder.NextTriggerUtc?.ToLocalTime():dd.MM.yyyy HH:mm}");
-                        break;
-
-                    case UserState.EditingTitle:
-                        Console.WriteLine("[Input] Processing EditingTitle");
-                        if (tempReminder == null) 
-                        {
+                            Console.WriteLine($"[Input] Creating reminder: {tempReminder.Title}, {tempReminder.ScheduleType}");
+                            
+                            // ПЕРЕИМЕНОВАНО: reminder -> newReminder
+                            var newReminder = await _reminderService.CreateReminderAsync(
+                                userId, tempReminder.Title, tempReminder.Text,
+                                tempReminder.ScheduleType, tempReminder.IntervalHours,
+                                tempReminder.IntervalMinutes, tempReminder.WeekDays, tempReminder.Time,
+                                user.TimezoneOffsetHours);
+                            
+                            _userStates.Remove(userId);
                             await botClient.SendTextMessageAsync(userId, 
-                                "⚠️ Ошибка сессии редактирования.");
-                            return;
-                        }
-                        tempReminder.Title = text;
-                        _userStates[userId] = (UserState.EditingText, tempReminder);
-                        await botClient.SendTextMessageAsync(userId, "📄 Введите новый текст напоминания:");
-                        break;
+                                $"✅ Напоминание \"{newReminder.Title}\" создано!\n" +
+                                $"Следующее срабатывание: {newReminder.NextTriggerUtc?.ToLocalTime():dd.MM.yyyy HH:mm}");
+                            break;
 
-                    case UserState.EditingText:
-                        Console.WriteLine("[Input] Processing EditingText");
-                        if (tempReminder == null) 
-                        {
-                            await botClient.SendTextMessageAsync(userId, 
-                                "️ Ошибка сессии редактирования.");
-                            return;
-                        }
-                        tempReminder.Text = text;
-                        _userStates[userId] = (UserState.EditingSchedule, tempReminder);
+                        case UserState.EditingText:
+                            Console.WriteLine("[Input] Processing EditingText");
+                            if (tempReminder == null) 
+                            {
+                                await botClient.SendTextMessageAsync(userId, 
+                                    "️ Ошибка сессии редактирования.");
+                                return;
+                            }
+                            tempReminder.Text = text;
+                            _userStates[userId] = (UserState.EditingSchedule, tempReminder);
                         
                         var editScheduleKeyboard = new InlineKeyboardMarkup(new[]
                         {
                             new[] { InlineKeyboardButton.WithCallbackData("📅 Каждый день", "edit_schedule_daily") },
-                            new[] { InlineKeyboardButton.WithCallbackData("⏰ Каждые N часов", "edit_schedule_hourly") },
-                            new[] { InlineKeyboardButton.WithCallbackData(" В определенные дни", "edit_schedule_weekly") }
+                            new[] { InlineKeyboardButton.WithCallbackData("⏰ Каждые N минут/часов", "edit_schedule_interval") }, // ← ИЗМЕНЕНО
+                            new[] { InlineKeyboardButton.WithCallbackData("📆 В определенные дни", "edit_schedule_weekly") }
                         });
                         await botClient.SendTextMessageAsync(userId, 
                             "Выберите новое расписание:", replyMarkup: editScheduleKeyboard);
@@ -489,6 +522,24 @@ namespace ReminderBot
                         Console.WriteLine("[Input] DeletingReminder - waiting for callback");
                         break;
 
+                    case UserState.SettingTimezone:
+                        Console.WriteLine("[Input] Processing SettingTimezone");
+                        var tzText = text.Trim().Replace("+", "");
+                        if (int.TryParse(tzText, out var tzOffset) && tzOffset >= -12 && tzOffset <= 14)
+                        {
+                            user.TimezoneOffsetHours = tzOffset;
+                            await _context.SaveChangesAsync();
+                            _userStates.Remove(userId);
+                            await botClient.SendTextMessageAsync(userId, 
+                                $"✅ Часовой пояс установлен: UTC{tzOffset:+#;-#;0}");
+                        }
+                        else
+                        {
+                            await botClient.SendTextMessageAsync(userId, 
+                                "❌ Неверный формат. Введите число от -12 до 14 (например, 3 или -5):");
+                        }
+                        break;
+
                     default:
                         if (state != UserState.Idle)
                         {
@@ -497,6 +548,8 @@ namespace ReminderBot
                         await botClient.SendTextMessageAsync(userId, 
                             "Используйте команды: /create_note, /edit_note, /delete_note, /all");
                         break;
+
+
                 }
             }
             catch (Exception ex)
@@ -523,9 +576,11 @@ namespace ReminderBot
                         parseMode: ParseMode.Html  // ← Именованный параметр
                         );
 
+                        var user = await _reminderService.GetUserByIdAsync(reminder.UserId);
                         reminder.NextTriggerUtc = CalculateNextTrigger(
                             reminder.ScheduleType, reminder.IntervalHours, 
-                            reminder.WeekDays, reminder.Time);
+                            reminder.IntervalMinutes, reminder.WeekDays, reminder.Time,
+                            user?.TimezoneOffsetHours ?? 0);
                         
                         await _reminderService.UpdateReminderAsync(reminder);
                     }
@@ -540,42 +595,41 @@ namespace ReminderBot
         }
 
         private static DateTime? CalculateNextTrigger(string scheduleType, int? intervalHours, 
-            string? weekDays, string time)
+            int? intervalMinutes, string? weekDays, string time, int timezoneOffsetHours = 0)
         {
             var now = DateTime.UtcNow;
-            
             if (!TimeSpan.TryParse(time, out var timeSpan))
                 return null;
-
-            var nextTrigger = now.Date.Add(timeSpan);
+            
+            // Создаем время с учетом часового пояса пользователя
+            var userLocalTime = now.AddHours(timezoneOffsetHours);
+            var nextTrigger = userLocalTime.Date.Add(timeSpan).AddHours(-timezoneOffsetHours);
+            
             if (nextTrigger <= now)
                 nextTrigger = nextTrigger.AddDays(1);
-
+            
             switch (scheduleType)
             {
                 case "Daily":
                     return nextTrigger;
-                
-                case "Hourly":
-                    if (intervalHours.HasValue)
-                        return now.AddHours(intervalHours.Value);
+                case "Interval":
+                    if (intervalMinutes.HasValue)
+                        return now.AddMinutes(intervalMinutes.Value);
                     return null;
-                
                 case "Weekly":
                     if (!string.IsNullOrEmpty(weekDays))
                     {
                         var days = weekDays.Split(',')
                             .Select(d => int.Parse(d.Trim()))
                             .ToList();
-                        
-                        while (!days.Contains((int)nextTrigger.DayOfWeek == 0 ? 7 : (int)nextTrigger.DayOfWeek))
+                        // Проверяем дни недели с учетом часового пояса
+                        while (!days.Contains((int)nextTrigger.AddHours(timezoneOffsetHours).DayOfWeek == 0 ? 7 : (int)nextTrigger.AddHours(timezoneOffsetHours).DayOfWeek))
                         {
                             nextTrigger = nextTrigger.AddDays(1);
                         }
                         return nextTrigger;
                     }
                     return null;
-                
                 default:
                     return null;
             }
@@ -603,13 +657,39 @@ namespace ReminderBot
             {
                 case "Daily":
                     return $"Каждый день в {reminder.Time}";
-                case "Hourly":
+                    
+                case "Interval":
+                    if (reminder.IntervalMinutes.HasValue)
+                    {
+                        var mins = reminder.IntervalMinutes.Value;
+                        if (mins >= 60 && mins % 60 == 0)
+                            return $"Каждые {mins / 60} ч.";
+                        else if (mins >= 60)
+                            return $"Каждые {mins / 60} ч. {mins % 60} мин.";
+                        else
+                            return $"Каждые {mins} мин.";
+                    }
+                    return "Каждые N мин."; // Новый тип расписания
+                case "Hourly":   // Оставляем для совместимости со старыми напоминаниями
+                    if (reminder.IntervalMinutes.HasValue)
+                    {
+                        var mins = reminder.IntervalMinutes.Value;
+                        if (mins >= 60 && mins % 60 == 0)
+                            return $"Каждые {mins / 60} ч. в {reminder.Time}";
+                        else if (mins >= 60)
+                            return $"Каждые {mins / 60} ч. {mins % 60} мин. в {reminder.Time}";
+                        else
+                            return $"Каждые {mins} мин. в {reminder.Time}";
+                    }
+                    // Фолбэк для старых записей, где могли сохраниться только IntervalHours
                     return $"Каждые {reminder.IntervalHours} ч. в {reminder.Time}";
+                    
                 case "Weekly":
                     var days = reminder.WeekDays?.Split(',')
                         .Select(d => GetDayName(int.Parse(d.Trim())))
                         .ToList();
                     return $"По {string.Join(", ", days ?? new List<string>())} в {reminder.Time}";
+                    
                 default:
                     return "Неизвестно";
             }
@@ -641,6 +721,38 @@ namespace ReminderBot
         {
             Console.WriteLine($"Ошибка: {exception.Message}");
             return Task.CompletedTask;
+        }
+        // Метод для загрузки переменных из .env файла
+        private static void LoadEnvFile()
+        {
+            // Используем полные имена, чтобы избежать конфликта с Telegram.Bot.Types.File
+            var envPath = System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), ".env");
+            
+            if (System.IO.File.Exists(envPath))
+            {
+                string[] lines = System.IO.File.ReadAllLines(envPath);
+                foreach (string line in lines)
+                {
+                    // Пропускаем пустые строки и комментарии
+                    if (string.IsNullOrWhiteSpace(line) || line.Trim().StartsWith("#"))
+                        continue;
+                    
+                    // Разделяем строку по первому знаку '=' максимум на 2 части
+                    string[] parts = line.Split(new char[] { '=' }, 2);
+                    
+                    if (parts.Length == 2)
+                    {
+                        string key = parts[0].Trim();
+                        string value = parts[1].Trim();
+                        Environment.SetEnvironmentVariable(key, value);
+                    }
+                }
+                Console.WriteLine("✅ Переменные окружения загружены из .env");
+            }
+            else
+            {
+                Console.WriteLine("⚠️ Файл .env не найден. Используются системные переменные окружения.");
+            }
         }
     }
 }

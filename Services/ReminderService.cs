@@ -25,8 +25,14 @@ namespace ReminderBot.Services
             return user;
         }
 
+        public async Task<AppUser?> GetUserByIdAsync(long telegramId)
+        {
+            return await _context.Users.FindAsync(telegramId);
+        }
+
         public async Task<Reminder?> CreateReminderAsync(long userId, string title, string text, 
-            string scheduleType, int? intervalHours, string? weekDays, string time)
+            string scheduleType, int? intervalHours, int? intervalMinutes, string? weekDays, string time,
+            int timezoneOffsetHours = 0)
         {
             var reminder = new Reminder
             {
@@ -35,9 +41,10 @@ namespace ReminderBot.Services
                 Text = text,
                 ScheduleType = scheduleType,
                 IntervalHours = intervalHours,
+                IntervalMinutes = intervalMinutes,
                 WeekDays = weekDays,
                 Time = time,
-                NextTriggerUtc = CalculateNextTrigger(scheduleType, intervalHours, weekDays, time)
+                NextTriggerUtc = CalculateNextTrigger(scheduleType, intervalHours, intervalMinutes, weekDays, time, timezoneOffsetHours)
             };
 
             _context.Reminders.Add(reminder);
@@ -61,9 +68,11 @@ namespace ReminderBot.Services
 
         public async Task<bool> UpdateReminderAsync(Reminder reminder)
         {
+            var user = await GetUserByIdAsync(reminder.UserId);
             reminder.NextTriggerUtc = CalculateNextTrigger(
-                reminder.ScheduleType, reminder.IntervalHours, reminder.WeekDays, reminder.Time);
-            
+                reminder.ScheduleType, reminder.IntervalHours, 
+                reminder.IntervalMinutes, reminder.WeekDays, reminder.Time,
+                user?.TimezoneOffsetHours ?? 0);
             _context.Reminders.Update(reminder);
             return await _context.SaveChangesAsync() > 0;
         }
@@ -72,9 +81,7 @@ namespace ReminderBot.Services
         {
             var reminder = await _context.Reminders
                 .FirstOrDefaultAsync(r => r.Id == reminderId && r.UserId == userId);
-            
             if (reminder == null) return false;
-
             reminder.IsActive = false;
             return await _context.SaveChangesAsync() > 0;
         }
@@ -89,14 +96,16 @@ namespace ReminderBot.Services
         }
 
         private DateTime? CalculateNextTrigger(string scheduleType, int? intervalHours, 
-            string? weekDays, string time)
+            int? intervalMinutes, string? weekDays, string time, int timezoneOffsetHours = 0)
         {
             var now = DateTime.UtcNow;
-            
             if (!TimeSpan.TryParse(time, out var timeSpan))
                 return null;
 
-            var nextTrigger = now.Date.Add(timeSpan);
+            // Учитываем часовой пояс пользователя
+            var userLocalTime = now.AddHours(timezoneOffsetHours);
+            var nextTrigger = userLocalTime.Date.Add(timeSpan).AddHours(-timezoneOffsetHours);
+
             if (nextTrigger <= now)
                 nextTrigger = nextTrigger.AddDays(1);
 
@@ -104,30 +113,23 @@ namespace ReminderBot.Services
             {
                 case "Daily":
                     return nextTrigger;
-                
-                case "Hourly":
-                    if (intervalHours.HasValue)
-                    {
-                        nextTrigger = now.AddHours(intervalHours.Value);
-                        return nextTrigger;
-                    }
+                case "Interval":
+                    if (intervalMinutes.HasValue)
+                        return now.AddMinutes(intervalMinutes.Value);
                     return null;
-                
                 case "Weekly":
                     if (!string.IsNullOrEmpty(weekDays))
                     {
                         var days = weekDays.Split(',')
                             .Select(d => int.Parse(d.Trim()))
                             .ToList();
-                        
-                        while (!days.Contains((int)nextTrigger.DayOfWeek == 0 ? 7 : (int)nextTrigger.DayOfWeek))
+                        while (!days.Contains((int)nextTrigger.AddHours(timezoneOffsetHours).DayOfWeek == 0 ? 7 : (int)nextTrigger.AddHours(timezoneOffsetHours).DayOfWeek))
                         {
                             nextTrigger = nextTrigger.AddDays(1);
                         }
                         return nextTrigger;
                     }
                     return null;
-                
                 default:
                     return null;
             }
