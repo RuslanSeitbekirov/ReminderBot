@@ -10,14 +10,16 @@ namespace ReminderBot.Services
         public const int EnteringInterval = 4;
         public const int EnteringWeekDays = 5;
         public const int EnteringTime = 6;
-
+        
         // Шаги редактирования
         public const int EditingTitle = 7;
         public const int EditingText = 8;
         public const int EditingSchedule = 9;
-
+        public const int EditingPreNotifications = 10;
+        public const int EditingReminderMenu = 11;
+        
         // Шаги удаления
-        public const int DeletingReminder = 10;
-        public const int SettingTimezone = 11;  // ← ДОБАВЬТЕ ЭТУ СТРОКУ
+        public const int DeletingReminder = 12;
+        public const int SettingTimezone = 13;
     }
 }
